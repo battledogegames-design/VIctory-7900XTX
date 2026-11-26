@@ -14,12 +14,16 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          fetch-depth: 2
+          fetch-depth: 3
           persist-credentials: false
-      - name: Verify parent, scope and lockfile
+      - name: Verify ancestry, scope and audited Rust blob
         run: |
           $base = '0a43566532c57b34a5397d6fdc91e419de32e8e9'
-          if ((git rev-parse HEAD^) -ne $base) { throw 'Unexpected base' }
+          git merge-base --is-ancestor $base HEAD
+          if ($LASTEXITCODE) { throw 'Expected base is not an ancestor' }
+          if ((git rev-list --count "$base..HEAD") -ne '2') { throw 'Unexpected commit count' }
+          $rust = git rev-parse 'HEAD:crates/victory-gpu/src/pipeline/host.rs'
+          if ($rust -ne 'a37ebdb30b1c0b9a33a2569032285b71be2a3fe6') { throw 'Rust blob changed' }
           $changed = @(git diff --name-only $base HEAD)
           $expected = @('.github/workflows/root19-native.yml','crates/victory-gpu/src/pipeline/host.rs')
           if (Compare-Object $expected $changed) { throw "Unexpected diff $changed" }
@@ -33,13 +37,14 @@ jobs:
       - name: Verify exact native regression
         run: |
           $test = 'pipeline::host::tests::direct_heap_flags_follow_final_features'
-          $output = cargo test --locked -p victory-gpu --lib $test -- --exact --nocapture | Tee-Object -Variable lines
+          $output = cargo test --locked -p victory-gpu --lib $test -- --exact --nocapture
           $exit = $LASTEXITCODE
           $output
           if ($exit) { exit $exit }
-          if (!(($lines -join "`n") -match 'test result: ok\. 1 passed; 0 failed;')) { throw 'Expected exactly one passing test' }
+          if (!(($output -join "`n") -match 'test result: ok\. 1 passed; 0 failed;')) { throw 'Expected exactly one passing test' }
       - name: Pipeline module tests
-        run: cargo test --locked -p victory-gpu --lib pipeline:: -- --nocapture
+        run: |
+          cargo test --locked -p victory-gpu --lib pipeline:: -- --nocapture --skip pipeline::host::tests::direct_heap_flags_follow_final_features
       - name: Target Clippy
         run: cargo clippy --locked -p victory-gpu --all-targets -- -D warnings
       - name: Confirm checkout and lockfile integrity

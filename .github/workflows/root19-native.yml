@@ -1,52 +1,99 @@
-name: Issue 19 native validation
+name: Issue 19 native comparison
 on:
   push:
     branches: [validation/root19-native]
 permissions:
   contents: read
 jobs:
-  native:
+  comparison:
     runs-on: windows-latest
     timeout-minutes: 60
     defaults:
       run:
         shell: pwsh
+    env:
+      BASE_SHA: 0a43566532c57b34a5397d6fdc91e419de32e8e9
+      DEPTH_TEST: pipeline::host::tests::depth_bounds_pipeline_loads_and_filters_draws
     steps:
       - uses: actions/checkout@v5
         with:
+          path: patched
           fetch-depth: 0
           persist-credentials: false
-      - name: Verify ancestry, scope and audited Rust blob
+      - uses: actions/checkout@v5
+        with:
+          ref: 0a43566532c57b34a5397d6fdc91e419de32e8e9
+          path: baseline
+          persist-credentials: false
+      - name: Verify revisions, ancestry, diff and audited source
+        id: integrity
         run: |
-          $base = '0a43566532c57b34a5397d6fdc91e419de32e8e9'
-          git merge-base --is-ancestor $base HEAD
-          if ($LASTEXITCODE) { throw 'Expected base is not an ancestor' }
-          if ((git rev-list --count "$base..HEAD") -ne '3') { throw 'Unexpected commit count' }
-          $rust = git rev-parse 'HEAD:crates/victory-gpu/src/pipeline/host.rs'
-          if ($rust -ne 'a37ebdb30b1c0b9a33a2569032285b71be2a3fe6') { throw 'Rust blob changed' }
-          $changed = @(git diff --name-only $base HEAD)
-          $expected = @('.github/workflows/root19-native.yml','crates/victory-gpu/src/pipeline/host.rs')
-          if (Compare-Object $expected $changed) { throw "Unexpected diff $changed" }
-          git diff --check $base HEAD
+          if ((git -C baseline rev-parse HEAD) -ne $env:BASE_SHA) { throw 'Wrong baseline' }
+          if ((git -C patched rev-parse HEAD) -ne $env:GITHUB_SHA) { throw 'Wrong candidate' }
+          git -C patched merge-base --is-ancestor $env:BASE_SHA HEAD
+          if ($LASTEXITCODE) { throw 'Invalid ancestry' }
+          $paths = @(git -C patched diff --name-only $env:BASE_SHA HEAD)
+          if (Compare-Object @('.github/workflows/root19-native.yml','crates/victory-gpu/src/pipeline/host.rs') $paths) { throw 'Unexpected scope' }
+          if ((git -C patched rev-parse 'HEAD:crates/victory-gpu/src/pipeline/host.rs') -ne 'a37ebdb30b1c0b9a33a2569032285b71be2a3fe6') { throw 'Rust source changed' }
+          git -C patched diff --check $env:BASE_SHA HEAD
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          Get-FileHash Cargo.lock
-      - name: Install pinned toolchain
-        run: rustup toolchain install
-      - name: Compile native production crate
-        run: cargo check --locked -p victory-gpu
-      - name: Verify exact native regression
+          Write-Host "Base=$env:BASE_SHA patched=$env:GITHUB_SHA image=$env:ImageOS version=$env:ImageVersion"
+          Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | Select-Object Name, DriverVersion
+      - name: Install pinned Rust and report versions
+        id: rust
+        working-directory: patched
         run: |
-          $test = 'pipeline::host::tests::direct_heap_flags_follow_final_features'
-          $output = cargo test --locked -p victory-gpu --lib $test -- --exact --nocapture
-          $exit = $LASTEXITCODE
+          rustup toolchain install
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          rustc --version --verbose
+          cargo clippy --version
+      - name: Compare depth readback twice per checkout
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $failed = $false
+          foreach ($round in 1,2) {
+            foreach ($repo in 'baseline','patched') {
+              Push-Location $repo
+              try {
+                $env:CARGO_TARGET_DIR = Join-Path $env:RUNNER_TEMP "target-$repo"
+                Write-Host "Depth test round=$round revision=$(git rev-parse HEAD) target=$env:CARGO_TARGET_DIR"
+                $output = cargo test --locked -p victory-gpu --lib $env:DEPTH_TEST -- --exact --nocapture
+                $status = $LASTEXITCODE
+                $output
+                if ($status -ne 0 -or !(($output -join "`n") -match 'test result: ok\. 1 passed; 0 failed;')) { $failed = $true }
+                Write-Host "Depth result $repo round=$round exit=$status"
+              } finally { Pop-Location }
+            }
+          }
+          if ($failed) { exit 1 }
+      - name: Focused candidate regression exactly once
+        if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
+        working-directory: patched
+        run: |
+          $env:CARGO_TARGET_DIR = Join-Path $env:RUNNER_TEMP 'target-patched'
+          $output = cargo test --locked -p victory-gpu --lib pipeline::host::tests::direct_heap_flags_follow_final_features -- --exact --nocapture
+          $status = $LASTEXITCODE
           $output
-          if ($exit) { exit $exit }
-          if (!(($output -join "`n") -match 'test result: ok\. 1 passed; 0 failed;')) { throw 'Expected exactly one passing test' }
-      - name: Pipeline module tests
+          if ($status) { exit $status }
+          if (!(($output -join "`n") -match 'test result: ok\. 1 passed; 0 failed;')) { throw 'Expected one passing regression' }
+      - name: Candidate Clippy
+        id: lint
+        if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
+        working-directory: patched
         run: |
-          cargo test --locked -p victory-gpu --lib pipeline:: -- --nocapture --skip pipeline::host::tests::direct_heap_flags_follow_final_features
-      - name: Target Clippy
-        run: cargo clippy --locked -p victory-gpu --all-targets -- -D warnings
-      - name: Confirm checkout and lockfile integrity
-        if: always()
-        run: git diff --exit-code HEAD --
+          $env:CARGO_TARGET_DIR = Join-Path $env:RUNNER_TEMP 'target-patched'
+          cargo clippy --locked -p victory-gpu --all-targets -- -D warnings
+      - name: Baseline Clippy on candidate lint failure
+        if: ${{ !cancelled() && steps.lint.outcome == 'failure' }}
+        working-directory: baseline
+        run: |
+          $env:CARGO_TARGET_DIR = Join-Path $env:RUNNER_TEMP 'target-baseline'
+          cargo clippy --locked -p victory-gpu --all-targets -- -D warnings
+      - name: Verify both checkouts and lockfiles
+        if: ${{ always() && steps.integrity.outcome == 'success' }}
+        run: |
+          foreach ($repo in 'baseline','patched') {
+            git -C $repo diff --exit-code HEAD --
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+            Get-FileHash "$repo/Cargo.lock"
+          }
